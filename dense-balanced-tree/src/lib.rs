@@ -1,0 +1,355 @@
+//! Dense balanced Merkle tree proof verification.
+//!
+//! Off-circuit preprocessing + in-circuit algebraic linking for
+//! `hash_bytes_flat`-based Poseidon Merkle trees (BN254 Fr).
+
+use halo2_base::{
+    gates::{GateInstructions, RangeInstructions},
+    halo2_proofs::halo2curves::{
+        bn256::Fr,
+        ff::PrimeField,
+    },
+    poseidon::hasher::PoseidonHasher,
+    AssignedValue, Context,
+};
+use pse_poseidon::Poseidon;
+
+const T: usize = 3;
+const RATE: usize = 2;
+const R_F: usize = 8;
+const R_P: usize = 57;
+
+/// Maximum number of dense balanced trees in a chain.
+pub const MAX_DENSE_CHAIN_LEN: usize = 10;
+
+// ---------------------------------------------------------------------------
+// Native (off-circuit) helpers
+// ---------------------------------------------------------------------------
+
+/// Native (off-circuit) Poseidon hash of BN254 Fr field elements.
+pub fn poseidon_hash_native(inputs: &[Fr]) -> Fr {
+    let mut poseidon = Poseidon::<Fr, T, RATE>::new(R_F, R_P);
+    poseidon.update(inputs);
+    poseidon.squeeze()
+}
+
+/// Conditional swap using gate.select: if swap=1, return (b, a); else (a, b).
+pub fn cond_swap(
+    ctx: &mut Context<Fr>,
+    gate: &impl GateInstructions<Fr>,
+    a: AssignedValue<Fr>,
+    b: AssignedValue<Fr>,
+    swap: AssignedValue<Fr>,
+) -> (AssignedValue<Fr>, AssignedValue<Fr>) {
+    let new_a = gate.select(ctx, b, a, swap);
+    let new_b = gate.select(ctx, a, b, swap);
+    (new_a, new_b)
+}
+
+/// Convert a 32-byte LE array to Fr.
+pub fn bytes_to_fr(bytes: &[u8; 32]) -> Fr {
+    Fr::from_raw([
+        u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+        u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+    ])
+}
+
+/// Convert Fr to 32-byte LE array.
+pub fn fr_to_bytes(fr: Fr) -> [u8; 32] {
+    fr.to_repr()
+}
+
+// ---------------------------------------------------------------------------
+// Proof types
+// ---------------------------------------------------------------------------
+
+/// Preprocessed data for one level of a dense balanced tree proof.
+/// Contains the sibling hash and the precomputed 31-byte chunks used by `hash_bytes_flat`.
+#[derive(Clone, Debug)]
+pub struct DenseProofLevel {
+    /// The sibling hash at this level (32 bytes)
+    pub sibling: [u8; 32],
+    /// Direction bit: false = current node is left child, true = current node is right child
+    pub direction_bit: bool,
+    /// chunk0 = Fr from left[0..31] zero-padded to 32 bytes LE
+    pub chunk0: Fr,
+    /// chunk1 = Fr from left[31]||right[0..30] zero-padded to 32 bytes LE (boundary-crossing chunk)
+    pub chunk1: Fr,
+    /// chunk2 = Fr from right[30..32] zero-padded to 32 bytes LE
+    pub chunk2: Fr,
+    /// left[31] as a single byte (used for algebraic linking)
+    pub left_hi: u8,
+}
+
+/// A fully preprocessed dense balanced tree proof ready for circuit verification.
+#[derive(Clone, Debug)]
+pub struct DenseTreeProof {
+    /// The leaf hash (32 bytes)
+    pub leaf: [u8; 32],
+    /// Preprocessed data for each tree level, from leaf to root.
+    pub levels: Vec<DenseProofLevel>,
+}
+
+// ---------------------------------------------------------------------------
+// Preprocessing
+// ---------------------------------------------------------------------------
+
+/// Convert 64 bytes into 3 Fr elements using 31-byte chunking (matching `hash_bytes_flat`).
+///
+/// Given `data[0..64]`:
+///   chunk0 = Fr::from_le_bytes(data[0..31] ++ [0])
+///   chunk1 = Fr::from_le_bytes(data[31..62] ++ [0])
+///   chunk2 = Fr::from_le_bytes(data[62..64] ++ [0; 30])
+fn chunk_64_bytes_to_fr(data: &[u8; 64]) -> (Fr, Fr, Fr) {
+    let mut buf0 = [0u8; 32];
+    buf0[..31].copy_from_slice(&data[0..31]);
+    let chunk0 = bytes_to_fr(&buf0);
+
+    let mut buf1 = [0u8; 32];
+    buf1[..31].copy_from_slice(&data[31..62]);
+    let chunk1 = bytes_to_fr(&buf1);
+
+    let mut buf2 = [0u8; 32];
+    buf2[..2].copy_from_slice(&data[62..64]);
+    let chunk2 = bytes_to_fr(&buf2);
+
+    (chunk0, chunk1, chunk2)
+}
+
+/// Preprocess a dense balanced tree proof for circuit verification.
+///
+/// Takes the raw leaf hash, sibling hashes (bottom-up), and the leaf position.
+/// Returns a `DenseTreeProof` with all chunks precomputed for each level.
+///
+/// The direction at each level is determined by the tree index:
+///   - Start with `idx = width - 1 + pos` (where `width = 2^depth`)
+///   - If `idx` is odd, current node is left child (direction_bit = false)
+///   - If `idx` is even, current node is right child (direction_bit = true)
+///   - Move up: `idx = (idx - 1) / 2`
+pub fn preprocess_dense_proof(
+    leaf: [u8; 32],
+    siblings: &[[u8; 32]],
+    pos: usize,
+) -> DenseTreeProof {
+    let depth = siblings.len();
+    let width = 1usize << depth;
+    let mut idx = width - 1 + pos;
+    let mut cur_bytes = leaf;
+    let mut levels = Vec::with_capacity(depth);
+
+    for j in 0..depth {
+        // Determine direction: odd index = left child, even index = right child
+        let is_right = idx % 2 == 0;
+        let (left_bytes, right_bytes) = if !is_right {
+            (cur_bytes, siblings[j])
+        } else {
+            (siblings[j], cur_bytes)
+        };
+
+        // Concatenate left || right (64 bytes)
+        let mut concat = [0u8; 64];
+        concat[..32].copy_from_slice(&left_bytes);
+        concat[32..].copy_from_slice(&right_bytes);
+
+        // Chunk into 3 Fr elements
+        let (chunk0, chunk1, chunk2) = chunk_64_bytes_to_fr(&concat);
+        let left_hi = left_bytes[31];
+
+        levels.push(DenseProofLevel {
+            sibling: siblings[j],
+            direction_bit: is_right,
+            chunk0,
+            chunk1,
+            chunk2,
+            left_hi,
+        });
+
+        // Compute native hash for next level
+        let hash_output = poseidon_hash_native(&[chunk0, chunk1, chunk2]);
+        cur_bytes = fr_to_bytes(hash_output);
+
+        // Move to parent
+        idx = (idx - 1) / 2;
+    }
+
+    DenseTreeProof { leaf, levels }
+}
+
+/// Compute the root hash natively from a preprocessed proof.
+/// Useful for testing that preprocessing matches the tree's own root computation.
+pub fn compute_root_native(proof: &DenseTreeProof) -> Fr {
+    let mut cur = Fr::zero();
+    for level in &proof.levels {
+        cur = poseidon_hash_native(&[level.chunk0, level.chunk1, level.chunk2]);
+    }
+    cur
+}
+
+// ---------------------------------------------------------------------------
+// In-circuit verification
+// ---------------------------------------------------------------------------
+
+/// Verify a dense balanced tree Merkle proof in-circuit.
+///
+/// Given a preprocessed `DenseTreeProof`, this function:
+/// 1. Loads the leaf as an Fr witness
+/// 2. At each level, performs conditional swap, loads chunk witnesses,
+///    enforces algebraic linking constraints, range checks, and hashes.
+/// 3. Returns the computed root as an `AssignedValue<Fr>`.
+///
+/// ## Chunking layout for `left[32] || right[32]` (64 bytes):
+///
+/// `hash_bytes_flat` splits at 31-byte boundaries:
+///   - chunk0 = Fr(left[0..31])              — 31 bytes (248 bits)
+///   - chunk1 = Fr(left[31] || right[0..30]) — 31 bytes (248 bits)
+///   - chunk2 = Fr(right[30..32])            — 2 bytes  (16 bits)
+///
+/// ## Algebraic linking constraints:
+///   - left_fr  = chunk0 + left_hi * 2^248       (left_hi = left[31], 1 byte)
+///   - right_fr = right_low + chunk2 * 2^240      (right_low = right[0..30], 30 bytes)
+///   - chunk1   = left_hi + 256 * right_low
+///
+/// ## Range checks (canonical decomposition):
+///   - chunk0 < 2^248, right_low < 2^240
+///   - left_hi < 2^8, chunk2 < 2^16
+///
+/// The `leaf_fr` parameter is the leaf hash as an assigned Fr value.
+/// The caller is responsible for loading and constraining it (e.g., linking
+/// it to a SHA-256 output). Use `bytes_to_fr(&leaf_bytes)` for the witness value.
+pub fn dense_merkle_root_circuit(
+    ctx: &mut Context<Fr>,
+    range: &impl RangeInstructions<Fr>,
+    hasher: &PoseidonHasher<Fr, T, RATE>,
+    proof: &DenseTreeProof,
+    leaf_fr: AssignedValue<Fr>,
+) -> AssignedValue<Fr> {
+    let gate = range.gate();
+
+    // 2^248 = 256^31: splits left[0..31] from left[31]
+    let pow_248 = ctx.load_constant(Fr::from_raw([0u64, 0u64, 0u64, 1u64 << 56]));
+    // 2^240 = 256^30: splits right[0..30] from right[30..32]
+    let pow_240 = ctx.load_constant(Fr::from_raw([0u64, 0u64, 0u64, 1u64 << 48]));
+    let two56 = ctx.load_constant(Fr::from(256u64));
+
+    let mut cur = leaf_fr;
+
+    for level in &proof.levels {
+        // Load sibling as witness
+        let sibling_fr = ctx.load_witness(bytes_to_fr(&level.sibling));
+
+        // Load direction bit
+        let bit_val = if level.direction_bit { Fr::one() } else { Fr::zero() };
+        let bit = ctx.load_witness(bit_val);
+        gate.assert_bit(ctx, bit);
+
+        // Conditional swap: if bit=1 (right child), swap so sibling is on left
+        let (left, right) = cond_swap(ctx, gate, cur, sibling_fr, bit);
+
+        // Load chunk witnesses
+        let c0 = ctx.load_witness(level.chunk0);
+        let c1 = ctx.load_witness(level.chunk1);
+        let c2 = ctx.load_witness(level.chunk2);
+        let left_hi = ctx.load_witness(Fr::from(level.left_hi as u64));
+
+        // Constraint 1: chunk0 + left_hi * 2^248 == left_fr
+        let lhs = gate.mul_add(ctx, left_hi, pow_248, c0);
+        ctx.constrain_equal(&lhs, &left);
+
+        // Constraint 2: right_low = right_fr - chunk2 * 2^240
+        let c2_shifted = gate.mul(ctx, c2, pow_240);
+        let right_low = gate.sub(ctx, right, c2_shifted);
+
+        // Constraint 3: chunk1 == left_hi + 256 * right_low
+        let rhs = gate.mul_add(ctx, right_low, two56, left_hi);
+        ctx.constrain_equal(&rhs, &c1);
+
+        // Range checks for canonical decomposition
+        range.range_check(ctx, c0, 248);       // 31 bytes
+        range.range_check(ctx, right_low, 240); // 30 bytes
+        range.range_check(ctx, left_hi, 8);     // 1 byte
+        range.range_check(ctx, c2, 16);         // 2 bytes
+
+        // Hash the 3 chunks to get the next level's value
+        cur = hasher.hash_fix_len_array(ctx, gate, &[c0, c1, c2]);
+    }
+
+    cur
+}
+
+// ---------------------------------------------------------------------------
+// Chain support
+// ---------------------------------------------------------------------------
+
+/// One link in a chain of dense balanced tree Merkle proofs.
+///
+/// Used to prove a sequence of Merkle memberships where each step's leaf
+/// is the previous step's computed root (or an independently supplied value).
+#[derive(Clone, Debug)]
+pub struct DenseChainLink {
+    /// Whether this link is active (contains a real proof).
+    pub active: bool,
+    /// Sibling hashes for the Merkle proof (bottom-up), one per tree level.
+    pub siblings: Vec<[u8; 32]>,
+    /// Leaf position in the tree.
+    pub position: usize,
+    /// Leaf bytes for this link.
+    pub leaf_native: [u8; 32],
+}
+
+impl DenseChainLink {
+    /// Create an inactive (padding) link with the given leaf bytes and depth.
+    pub fn inactive(leaf_bytes: [u8; 32], depth: usize) -> Self {
+        Self {
+            active: false,
+            siblings: vec![[0u8; 32]; depth],
+            position: 0,
+            leaf_native: leaf_bytes,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chunk_64_bytes() {
+        let mut data = [0u8; 64];
+        for i in 0..64 {
+            data[i] = i as u8;
+        }
+
+        let (c0, c1, c2) = chunk_64_bytes_to_fr(&data);
+
+        // Verify chunk0: bytes 0..31 in LE
+        let mut expected0 = [0u8; 32];
+        expected0[..31].copy_from_slice(&data[0..31]);
+        assert_eq!(c0, bytes_to_fr(&expected0));
+
+        // Verify chunk1: bytes 31..62 in LE
+        let mut expected1 = [0u8; 32];
+        expected1[..31].copy_from_slice(&data[31..62]);
+        assert_eq!(c1, bytes_to_fr(&expected1));
+
+        // Verify chunk2: bytes 62..64 in LE
+        let mut expected2 = [0u8; 32];
+        expected2[..2].copy_from_slice(&data[62..64]);
+        assert_eq!(c2, bytes_to_fr(&expected2));
+    }
+
+    #[test]
+    fn test_dense_chain_link_inactive() {
+        let leaf = [0xABu8; 32];
+        let link = DenseChainLink::inactive(leaf, 8);
+        assert!(!link.active);
+        assert_eq!(link.siblings.len(), 8);
+        assert_eq!(link.leaf_native, leaf);
+        assert_eq!(link.position, 0);
+    }
+}

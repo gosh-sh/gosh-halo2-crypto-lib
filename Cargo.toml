@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "sha256-chip",
+    "dense-balanced-tree",
+    "bls-verification",
+]
+resolver = "2"
+
+[patch.crates-io]
+halo2-base = { git = "https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381", branch = "main" }
+
+[profile.dev]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 3

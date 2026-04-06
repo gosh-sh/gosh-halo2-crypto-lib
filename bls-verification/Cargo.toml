@@ -1,0 +1,13 @@
+[package]
+name = "gosh-bls-verification"
+version = "0.1.0"
+edition = "2021"
+description = "BLS12-381 signature verification circuit (GOSH crypto library)"
+
+[dependencies]
+halo2-base = { git = "https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381", branch = "main", default-features = false, features = ["halo2-axiom"] }
+halo2-ecc = { git = "https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381", branch = "main", default-features = false, features = ["halo2-axiom"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+halo2-base = { git = "https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381", branch = "main", default-features = false, features = ["halo2-axiom", "test-utils"] }

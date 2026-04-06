@@ -1,0 +1,14 @@
+[package]
+name = "gosh-sha256-chip"
+version = "0.1.0"
+edition = "2021"
+description = "Native eDSL SHA-256 chip for halo2-base circuits (GOSH crypto library)"
+
+[dependencies]
+halo2-base = { git = "https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381", branch = "main", default-features = false, features = ["halo2-axiom"] }
+halo2-ecc = { git = "https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381", branch = "main", default-features = false, features = ["halo2-axiom"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+halo2-base = { git = "https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381", branch = "main", default-features = false, features = ["halo2-axiom", "test-utils"] }
+hex = "0.4"
