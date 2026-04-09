@@ -19,8 +19,10 @@ const RATE: usize = 2;
 const R_F: usize = 8;
 const R_P: usize = 57;
 
-/// Maximum number of dense balanced trees in a chain.
-pub const MAX_DENSE_CHAIN_LEN: usize = 10;
+/// Maximum number of dense balanced trees in a verification chain.
+/// Both gosh-dark-dex and layer-hashes-update circuits use this constant
+/// so that one verification key works for any chain length in [1..MAX_CHAIN_LEN].
+pub const MAX_CHAIN_LEN: usize = 11;
 
 // ---------------------------------------------------------------------------
 // Native (off-circuit) helpers
@@ -308,6 +310,57 @@ impl DenseChainLink {
             leaf_native: leaf_bytes,
         }
     }
+}
+
+/// Verify a chain of dense balanced tree proofs in-circuit.
+///
+/// Starting from `initial_leaf_fr`, each active link proves that the current
+/// root is a leaf of the next tree. The first `num_active_steps` links are
+/// active; the rest are masked out via `gate.select`.
+///
+/// The caller MUST constrain `num_active_steps` to `[1, chain.len()]` before
+/// calling this function (e.g., via range checks).
+///
+/// `chain` must have exactly `MAX_CHAIN_LEN` entries. The circuit shape is
+/// fixed regardless of how many steps are actually active, so one verification
+/// key works for any chain length in `[1, MAX_CHAIN_LEN]`.
+///
+/// Returns the final root (last active tree's root).
+pub fn verify_chain_of_dense_proofs(
+    ctx: &mut Context<Fr>,
+    range: &impl RangeInstructions<Fr>,
+    hasher: &PoseidonHasher<Fr, T, RATE>,
+    initial_leaf_fr: AssignedValue<Fr>,
+    chain: &[DenseChainLink],
+    num_active_steps: AssignedValue<Fr>,
+) -> AssignedValue<Fr> {
+    assert_eq!(chain.len(), MAX_CHAIN_LEN);
+    let gate = range.gate();
+
+    let mut current = initial_leaf_fr;
+
+    for (j, link) in chain.iter().enumerate() {
+        // active = (j < num_active_steps)
+        let j_const = ctx.load_constant(Fr::from(j as u64));
+        let active = range.is_less_than(ctx, j_const, num_active_steps, 4);
+
+        // Preprocess the proof using leaf_native bytes (off-circuit).
+        let dense_proof = preprocess_dense_proof(
+            link.leaf_native,
+            &link.siblings,
+            link.position,
+        );
+
+        // Verify the proof in-circuit with current as the leaf.
+        let computed_root = dense_merkle_root_circuit(
+            ctx, range, hasher, &dense_proof, current,
+        );
+
+        // If active, use computed_root; otherwise keep current.
+        current = gate.select(ctx, computed_root, current, active);
+    }
+
+    current
 }
 
 // ---------------------------------------------------------------------------
