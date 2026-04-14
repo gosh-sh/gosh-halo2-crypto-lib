@@ -84,7 +84,7 @@ impl<'a, F: BigPrimeField> Sha256Chip<'a, F> {
 
     /// Convert 8 u32 state words into 32 big-endian bytes with range checks
     /// and composition verification.
-    fn state_to_bytes(
+    pub fn state_to_bytes(
         &self,
         ctx: &mut Context<F>,
         state: &[AssignedValue<F>],

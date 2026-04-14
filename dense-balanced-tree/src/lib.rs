@@ -179,6 +179,88 @@ pub fn preprocess_dense_proof(
     DenseTreeProof { leaf, levels }
 }
 
+/// Preprocess a dense balanced tree proof, padding to `max_depth` levels.
+///
+/// The first `siblings.len()` levels are identical to `preprocess_dense_proof`.
+/// The remaining `max_depth - siblings.len()` levels are dummy: `sibling=[0;32]`,
+/// `direction_bit=false`, chunks computed from `cur_bytes || [0;32]` (identity
+/// pair — in-circuit `gate.select` will keep `cur` unchanged for these levels).
+///
+/// Panics if `siblings.len() > max_depth`.
+pub fn preprocess_dense_proof_padded(
+    leaf: [u8; 32],
+    siblings: &[[u8; 32]],
+    pos: usize,
+    max_depth: usize,
+) -> DenseTreeProof {
+    assert!(
+        siblings.len() <= max_depth,
+        "siblings.len()={} exceeds max_depth={}",
+        siblings.len(),
+        max_depth
+    );
+
+    let real_depth = siblings.len();
+    let width = 1usize << real_depth;
+    let mut idx = width - 1 + pos;
+    let mut cur_bytes = leaf;
+    let mut levels = Vec::with_capacity(max_depth);
+
+    // Real levels (identical to preprocess_dense_proof)
+    for j in 0..real_depth {
+        let is_right = idx % 2 == 0;
+        let (left_bytes, right_bytes) = if !is_right {
+            (cur_bytes, siblings[j])
+        } else {
+            (siblings[j], cur_bytes)
+        };
+
+        let mut concat = [0u8; 64];
+        concat[..32].copy_from_slice(&left_bytes);
+        concat[32..].copy_from_slice(&right_bytes);
+        let (chunk0, chunk1, chunk2) = chunk_64_bytes_to_fr(&concat);
+        let left_hi = left_bytes[31];
+
+        levels.push(DenseProofLevel {
+            sibling: siblings[j],
+            direction_bit: is_right,
+            chunk0,
+            chunk1,
+            chunk2,
+            left_hi,
+        });
+
+        let hash_output = poseidon_hash_native(&[chunk0, chunk1, chunk2]);
+        cur_bytes = fr_to_bytes(hash_output);
+        idx = (idx - 1) / 2;
+    }
+
+    // Dummy levels: cur_bytes is the real root, sibling = [0;32], direction = false (left child).
+    // Chunks are computed from cur_bytes || [0;32] so witnesses are consistent.
+    // In-circuit, gate.select keeps `cur` unchanged for inactive levels, so
+    // cur_bytes must NOT advance — all dummy levels use the same cur_bytes.
+    let dummy_cur_bytes = cur_bytes;
+    for _ in real_depth..max_depth {
+        let dummy_sibling = [0u8; 32];
+        let mut concat = [0u8; 64];
+        concat[..32].copy_from_slice(&dummy_cur_bytes);
+        concat[32..].copy_from_slice(&dummy_sibling);
+        let (chunk0, chunk1, chunk2) = chunk_64_bytes_to_fr(&concat);
+        let left_hi = dummy_cur_bytes[31];
+
+        levels.push(DenseProofLevel {
+            sibling: dummy_sibling,
+            direction_bit: false,
+            chunk0,
+            chunk1,
+            chunk2,
+            left_hi,
+        });
+    }
+
+    DenseTreeProof { leaf, levels }
+}
+
 /// Compute the root hash natively from a preprocessed proof.
 /// Useful for testing that preprocessing matches the tree's own root computation.
 pub fn compute_root_native(proof: &DenseTreeProof) -> Fr {
@@ -275,6 +357,80 @@ pub fn dense_merkle_root_circuit(
 
         // Hash the 3 chunks to get the next level's value
         cur = hasher.hash_fix_len_array(ctx, gate, &[c0, c1, c2]);
+    }
+
+    cur
+}
+
+/// Verify a dense balanced tree Merkle proof in-circuit with fixed iteration count.
+///
+/// Like `dense_merkle_root_circuit`, but always iterates over all `proof.levels`
+/// and uses `gate.select` to mask out inactive levels (where `j >= num_active_levels`).
+/// This ensures the circuit shape is identical regardless of the real tree depth,
+/// so one verification key works for any depth up to `proof.levels.len()`.
+///
+/// `num_active_levels` must be in `[0, proof.levels.len()]` (caller must range-check).
+pub fn dense_merkle_root_circuit_padded(
+    ctx: &mut Context<Fr>,
+    range: &impl RangeInstructions<Fr>,
+    hasher: &PoseidonHasher<Fr, T, RATE>,
+    proof: &DenseTreeProof,
+    leaf_fr: AssignedValue<Fr>,
+    num_active_levels: AssignedValue<Fr>,
+) -> AssignedValue<Fr> {
+    let gate = range.gate();
+
+    let pow_248 = ctx.load_constant(Fr::from_raw([0u64, 0u64, 0u64, 1u64 << 56]));
+    let pow_240 = ctx.load_constant(Fr::from_raw([0u64, 0u64, 0u64, 1u64 << 48]));
+    let two56 = ctx.load_constant(Fr::from(256u64));
+
+    let mut cur = leaf_fr;
+
+    for (j, level) in proof.levels.iter().enumerate() {
+        // active = (j < num_active_levels)
+        let j_const = ctx.load_constant(Fr::from(j as u64));
+        let active = range.is_less_than(ctx, j_const, num_active_levels, 4);
+
+        // Load sibling as witness
+        let sibling_fr = ctx.load_witness(bytes_to_fr(&level.sibling));
+
+        // Load direction bit
+        let bit_val = if level.direction_bit { Fr::one() } else { Fr::zero() };
+        let bit = ctx.load_witness(bit_val);
+        gate.assert_bit(ctx, bit);
+
+        // Conditional swap: if bit=1 (right child), swap so sibling is on left
+        let (left, right) = cond_swap(ctx, gate, cur, sibling_fr, bit);
+
+        // Load chunk witnesses
+        let c0 = ctx.load_witness(level.chunk0);
+        let c1 = ctx.load_witness(level.chunk1);
+        let c2 = ctx.load_witness(level.chunk2);
+        let left_hi = ctx.load_witness(Fr::from(level.left_hi as u64));
+
+        // Constraint 1: chunk0 + left_hi * 2^248 == left_fr
+        let lhs = gate.mul_add(ctx, left_hi, pow_248, c0);
+        ctx.constrain_equal(&lhs, &left);
+
+        // Constraint 2: right_low = right_fr - chunk2 * 2^240
+        let c2_shifted = gate.mul(ctx, c2, pow_240);
+        let right_low = gate.sub(ctx, right, c2_shifted);
+
+        // Constraint 3: chunk1 == left_hi + 256 * right_low
+        let rhs = gate.mul_add(ctx, right_low, two56, left_hi);
+        ctx.constrain_equal(&rhs, &c1);
+
+        // Range checks for canonical decomposition
+        range.range_check(ctx, c0, 248);
+        range.range_check(ctx, right_low, 240);
+        range.range_check(ctx, left_hi, 8);
+        range.range_check(ctx, c2, 16);
+
+        // Hash the 3 chunks to get the computed value for this level
+        let computed = hasher.hash_fix_len_array(ctx, gate, &[c0, c1, c2]);
+
+        // If active, use computed; otherwise keep cur unchanged
+        cur = gate.select(ctx, computed, cur, active);
     }
 
     cur
@@ -404,5 +560,75 @@ mod tests {
         assert_eq!(link.siblings.len(), 8);
         assert_eq!(link.leaf_native, leaf);
         assert_eq!(link.position, 0);
+    }
+
+    #[test]
+    fn test_preprocess_padded_matches_unpadded() {
+        // When max_depth == real_depth, padded should produce identical levels.
+        let leaf = [0x42u8; 32];
+        let siblings: Vec<[u8; 32]> = (0..3)
+            .map(|i| {
+                let mut s = [0u8; 32];
+                s[0] = (i + 1) as u8;
+                s
+            })
+            .collect();
+
+        let unpadded = preprocess_dense_proof(leaf, &siblings, 2);
+        let padded = preprocess_dense_proof_padded(leaf, &siblings, 2, 3);
+
+        assert_eq!(unpadded.levels.len(), 3);
+        assert_eq!(padded.levels.len(), 3);
+        for (u, p) in unpadded.levels.iter().zip(padded.levels.iter()) {
+            assert_eq!(u.sibling, p.sibling);
+            assert_eq!(u.direction_bit, p.direction_bit);
+            assert_eq!(u.chunk0, p.chunk0);
+            assert_eq!(u.chunk1, p.chunk1);
+            assert_eq!(u.chunk2, p.chunk2);
+            assert_eq!(u.left_hi, p.left_hi);
+        }
+    }
+
+    #[test]
+    fn test_preprocess_padded_extra_levels() {
+        let leaf = [0x11u8; 32];
+        let siblings: Vec<[u8; 32]> = vec![[0xAAu8; 32], [0xBBu8; 32]];
+
+        let padded = preprocess_dense_proof_padded(leaf, &siblings, 0, 5);
+        assert_eq!(padded.levels.len(), 5);
+
+        // First 2 levels should match unpadded
+        let unpadded = preprocess_dense_proof(leaf, &siblings, 0);
+        for i in 0..2 {
+            assert_eq!(padded.levels[i].sibling, unpadded.levels[i].sibling);
+            assert_eq!(padded.levels[i].direction_bit, unpadded.levels[i].direction_bit);
+            assert_eq!(padded.levels[i].chunk0, unpadded.levels[i].chunk0);
+        }
+
+        // Dummy levels: sibling=[0;32], direction=false, all identical chunks
+        for j in 2..5 {
+            assert_eq!(padded.levels[j].sibling, [0u8; 32]);
+            assert!(!padded.levels[j].direction_bit);
+        }
+        // All dummy levels must have identical chunks (same cur_bytes, no advancement)
+        for j in 3..5 {
+            assert_eq!(padded.levels[j].chunk0, padded.levels[2].chunk0);
+            assert_eq!(padded.levels[j].chunk1, padded.levels[2].chunk1);
+            assert_eq!(padded.levels[j].chunk2, padded.levels[2].chunk2);
+            assert_eq!(padded.levels[j].left_hi, padded.levels[2].left_hi);
+        }
+    }
+
+    #[test]
+    fn test_preprocess_padded_zero_depth() {
+        let leaf = [0xFFu8; 32];
+        let padded = preprocess_dense_proof_padded(leaf, &[], 0, 4);
+        assert_eq!(padded.levels.len(), 4);
+        assert_eq!(padded.leaf, leaf);
+        // All levels are dummy
+        for level in &padded.levels {
+            assert_eq!(level.sibling, [0u8; 32]);
+            assert!(!level.direction_bit);
+        }
     }
 }
