@@ -12,3 +12,4 @@ sha2 = "0.10"
 [dev-dependencies]
 halo2-base = { git = "https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381", branch = "main", default-features = false, features = ["halo2-axiom", "test-utils"] }
 hex = "0.4"
+rand = "0.8"

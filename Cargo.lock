@@ -1417,6 +1417,7 @@ dependencies = [
  "halo2-base 0.4.0",
  "halo2-ecc",
  "hex",
+ "rand 0.8.5",
  "sha2 0.10.9",
 ]
 

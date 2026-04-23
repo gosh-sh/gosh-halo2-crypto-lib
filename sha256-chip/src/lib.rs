@@ -379,6 +379,46 @@ mod tests {
         );
     }
 
+    /// Measure exact cell counts per SHA-256 block.
+    #[test]
+    fn test_sha256_cell_count() {
+        // Helper to run SHA-256 on an input of `input_len` bytes and print stats.
+        fn measure(label: &str, input_len: usize) {
+            let mut builder = BaseCircuitBuilder::<Fr>::new(false).use_k(20);
+            builder.set_lookup_bits(16);
+            let range = builder.range_chip();
+            {
+                let ctx = builder.main(0);
+                let chip = Sha256Chip::new(&range);
+                let input: Vec<AssignedValue<Fr>> = (0..input_len)
+                    .map(|i| ctx.load_witness(Fr::from((i & 0xFF) as u64)))
+                    .collect();
+                let _ = chip.digest_bytes(ctx, &input);
+            }
+            let stats = builder.statistics();
+            println!("=== {} ===", label);
+            println!(
+                "  gate.total_advice_per_phase: {:?}",
+                stats.gate.total_advice_per_phase
+            );
+            println!("  gate.total_fixed: {}", stats.gate.total_fixed);
+            println!(
+                "  total_lookup_advice_per_phase: {:?}",
+                stats.total_lookup_advice_per_phase
+            );
+            let params = builder.calculate_params(Some(20));
+            println!("  calculated params: {:?}", params);
+        }
+
+        measure("1 block  (0 bytes input)", 0);
+        measure("1 block  (55 bytes input)", 55);
+        measure("2 blocks (56 bytes input)", 56);
+        measure("2 blocks (64 bytes input)", 64);
+        measure("3 blocks (120 bytes input)", 120);
+        measure("3 blocks (128 bytes input)", 128);
+        measure("4 blocks (192 bytes input)", 192);
+    }
+
     /// Constraining the SHA-256 output to a wrong value must be detected.
     #[test]
     fn test_sha256_rejects_wrong_hash_constraint() {
@@ -429,5 +469,91 @@ mod tests {
             prover.verify().is_err(),
             "MockProver should reject wrong hash constraint"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Real prover tests — full KZG keygen / prove / verify cycle
+    // ---------------------------------------------------------------------------
+
+    /// Helper: run a real KZG proof for SHA-256 of `len` random bytes.
+    fn run_sha256_real_proof(len: usize) {
+        use rand::RngCore;
+        use rand::rngs::OsRng;
+        use std::time::Instant;
+
+        let num_blocks = (len + 9 + 63) / 64;
+        let cells_needed = num_blocks as u64 * 354_100;
+        // Pick K: we need 2^K rows > cells / num_advice_cols + lookup_table_size
+        // With auto-tuned columns, calculate_params handles this.
+        // Start with a generous K estimate.
+        let k_estimate = if cells_needed < 100_000 { 17 }
+            else if cells_needed < 500_000 { 18 }
+            else if cells_needed < 1_500_000 { 19 }
+            else if cells_needed < 5_000_000 { 20 }
+            else if cells_needed < 15_000_000 { 21 }
+            else if cells_needed < 50_000_000 { 22 }
+            else { 23 };
+
+        println!("=== gosh-sha256-chip: {} bytes ({} blocks) ===", len, num_blocks);
+        println!("  Estimated advice cells: {}", cells_needed);
+
+        // Generate random input.
+        let mut input_bytes = vec![0u8; len];
+        OsRng.fill_bytes(&mut input_bytes);
+
+        // Use bench_builder for the full keygen/prove/verify cycle.
+        let t_total = Instant::now();
+        let stats = base_test()
+            .k(k_estimate)
+            .lookup_bits(k_estimate as usize - 1)
+            .bench_builder(
+                vec![0u8; len],      // init_input for keygen
+                input_bytes.clone(),  // logic_input for proving
+                |builder, range, input: Vec<u8>| {
+                    let ctx = builder.main();
+                    let chip = Sha256Chip::new(range);
+                    let assigned: Vec<AssignedValue<Fr>> = input
+                        .iter()
+                        .map(|&b| ctx.load_witness(Fr::from(b as u64)))
+                        .collect();
+                    let _result = chip.digest_bytes(ctx, &assigned);
+                },
+            );
+        println!("  Config: {:?}", stats.config_params);
+        println!("  Proof size: {} bytes", stats.proof_size);
+        println!("  Total time: {:?}", t_total.elapsed());
+    }
+
+    #[test]
+    fn test_sha256_real_proof_55_bytes() {
+        run_sha256_real_proof(55);
+    }
+
+    #[test]
+    fn test_sha256_real_proof_4096_bytes() {
+        run_sha256_real_proof(4096);
+    }
+
+    #[test]
+    fn test_sha256_real_proof_4099_bytes() {
+        run_sha256_real_proof(4099);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_sha256_real_proof_10000_bytes() {
+        run_sha256_real_proof(10_000);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_sha256_real_proof_100000_bytes() {
+        run_sha256_real_proof(100_000);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_sha256_real_proof_1mb() {
+        run_sha256_real_proof(1_048_576);
     }
 }
