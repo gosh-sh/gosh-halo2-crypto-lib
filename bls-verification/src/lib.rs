@@ -83,12 +83,18 @@ pub fn compute_all_pub_sum<F: BigPrimeField>(
 /// signers is loaded as a witness and constrained in-circuit, so the same verification
 /// key works for any number of signers up to the capacity.
 ///
+/// `assigned_pks` may be padded to `max_signers` for fixed circuit structure.
+/// `actual_num_pubkeys` is the real BK set size, used for the threshold check and
+/// signer index bounds.  The indicator/weights/MSM use `assigned_pks.len()` so that
+/// padding pubkeys participate in the MSM (their zero weights + shift cancel via
+/// the `all_pub_sum` correction).
+///
 /// Constrains:
 /// - `n_signers` is in `[1, max_signers]`
 /// - Threshold check determined by `threshold_mode`:
-///   - Primary: `3 * n_signers >= 2 * n_pubkeys`
-///   - Fallback: `2 * n_signers > n_pubkeys`
-/// - Active slots (`i < n_signers`): index < n_pubkeys, count >= 1, strictly increasing indices
+///   - Primary: `3 * n_signers >= 2 * actual_num_pubkeys`
+///   - Fallback: `2 * n_signers > actual_num_pubkeys`
+/// - Active slots (`i < n_signers`): index < actual_num_pubkeys, count >= 1, strictly increasing indices
 /// - Inactive slots (`i >= n_signers`): index == 0, count == 0
 /// - Aggregated pubkey is correctly composed from active-slot pubkeys × counts
 /// - G2 signature lies on the BLS12-381 G2 curve
@@ -108,18 +114,19 @@ pub fn verify_bls_attestation_with_assigned_msghash<F: BigPrimeField>(
     num_limbs: usize,
     threshold_mode: ThresholdMode,
     all_pub_sum: EcPoint<F, ProperCrtUint<F>>,
+    actual_num_pubkeys: usize,
 ) {
     let n_pubkeys = assigned_pks.len();
     let n_signers = signers_data.len();
     assert!(n_signers > 0, "must have at least one signer");
     assert!(n_signers <= max_signers, "n_signers exceeds max_signers");
     assert!(max_signers > 0, "max_signers must be positive");
-    assert!(n_pubkeys > 0, "must have at least one pubkey in bk_set");
+    assert!(actual_num_pubkeys > 0, "must have at least one pubkey in bk_set");
     assert!(
-        n_pubkeys <= max_signers,
-        "n_pubkeys ({}) > max_signers ({}): circuit cannot represent all valid signer sets",
-        n_pubkeys,
-        max_signers
+        actual_num_pubkeys <= n_pubkeys,
+        "actual_num_pubkeys ({}) > assigned_pks.len() ({})",
+        actual_num_pubkeys,
+        n_pubkeys
     );
 
     // Bit-width sufficient to represent max_signers and n_pubkeys values.
@@ -165,13 +172,13 @@ pub fn verify_bls_attestation_with_assigned_msghash<F: BigPrimeField>(
 
         // 4. Threshold check determined by threshold_mode (fixed at circuit build time).
         //
-        // Primary: 3 * n_signers >= 2 * n_pubkeys  (>= ceil(2n/3))
-        //   Prove: (3 * n_signers - 2 * n_pubkeys) >= 0  via range check.
+        // Primary: 3 * n_signers >= 2 * actual_num_pubkeys  (>= ceil(2n/3))
+        //   Prove: (3 * n_signers - 2 * actual_num_pubkeys) >= 0  via range check.
         //
-        // Fallback: 2 * n_signers > n_pubkeys  (> 50%)
-        //   Prove: (2 * n_signers - n_pubkeys - 1) >= 0  via range check.
+        // Fallback: 2 * n_signers > actual_num_pubkeys  (> 50%)
+        //   Prove: (2 * n_signers - actual_num_pubkeys - 1) >= 0  via range check.
         {
-            let n_pk = ctx.load_constant(F::from(n_pubkeys as u64));
+            let n_pk = ctx.load_constant(F::from(actual_num_pubkeys as u64));
             let check_val = match threshold_mode {
                 ThresholdMode::Primary => {
                     let three = ctx.load_constant(F::from(3u64));
@@ -210,8 +217,8 @@ pub fn verify_bls_attestation_with_assigned_msghash<F: BigPrimeField>(
 
         // 7. Active-slot constraints.
         for i in 0..max_signers {
-            // 7a. idx < n_pubkeys.
-            range.check_less_than_safe(ctx, idx_cells[i], n_pubkeys as u64);
+            // 7a. idx < actual_num_pubkeys (prevent referencing padding pubkeys).
+            range.check_less_than_safe(ctx, idx_cells[i], actual_num_pubkeys as u64);
 
             // 7b. Strict monotonicity for consecutive active slots.
             if i + 1 < max_signers {
@@ -489,6 +496,7 @@ mod tests {
                 5,
                 ThresholdMode::Primary,
                 all_pub_sum,
+                1, // actual_num_pubkeys
             );
         });
         println!("In-circuit BLS (sk=1) MockProver passed!");
@@ -530,6 +538,7 @@ mod tests {
                 5,
                 ThresholdMode::Primary,
                 all_pub_sum,
+                1, // actual_num_pubkeys
             );
         });
     }
