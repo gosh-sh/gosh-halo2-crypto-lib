@@ -283,7 +283,7 @@ pub fn verify_bls_attestation_with_assigned_msghash<F: BigPrimeField>(
 
     // 8d. Recover agg_pk = msm_result - all_pub_sum.
     let neg_all_pub_sum = g1_chip.negate(ctx, all_pub_sum);
-    let acc = g1_chip.add_unequal(ctx, msm_result, neg_all_pub_sum, false);
+    let acc = g1_chip.add_unequal(ctx, msm_result, neg_all_pub_sum, true);
 
     // 9. Load signature and verify BLS pairing check.
     let sig_assigned = pairing_chip.load_private_g2_unchecked(ctx, signature);
