@@ -114,20 +114,14 @@ pub fn verify_bls_attestation_with_assigned_msghash<F: BigPrimeField>(
     num_limbs: usize,
     threshold_mode: ThresholdMode,
     all_pub_sum: EcPoint<F, ProperCrtUint<F>>,
-    actual_num_pubkeys: usize,
+    actual_num_pubkeys: AssignedValue<F>,
 ) {
     let n_pubkeys = assigned_pks.len();
     let n_signers = signers_data.len();
     assert!(n_signers > 0, "must have at least one signer");
     assert!(n_signers <= max_signers, "n_signers exceeds max_signers");
     assert!(max_signers > 0, "max_signers must be positive");
-    assert!(actual_num_pubkeys > 0, "must have at least one pubkey in bk_set");
-    assert!(
-        actual_num_pubkeys <= n_pubkeys,
-        "actual_num_pubkeys ({}) > assigned_pks.len() ({})",
-        actual_num_pubkeys,
-        n_pubkeys
-    );
+    assert!(n_pubkeys > 0, "must have at least one pubkey in assigned_pks");
 
     // Bit-width sufficient to represent max_signers and n_pubkeys values.
     let idx_bits = (usize::BITS - max_signers.leading_zeros()).max(1) as usize;
@@ -170,7 +164,16 @@ pub fn verify_bls_attestation_with_assigned_msghash<F: BigPrimeField>(
             range.range_check(ctx, slack, idx_bits);
         }
 
-        // 4. Threshold check determined by threshold_mode (fixed at circuit build time).
+        // 4. Constrain actual_num_pubkeys in [1, max_signers].
+        let npk_minus_one = gate.sub(ctx, actual_num_pubkeys, one);
+        range.range_check(ctx, npk_minus_one, idx_bits);
+        {
+            let max_s = ctx.load_constant(F::from(max_signers as u64));
+            let npk_slack = gate.sub(ctx, max_s, actual_num_pubkeys);
+            range.range_check(ctx, npk_slack, idx_bits);
+        }
+
+        // 5. Threshold check determined by threshold_mode (fixed at circuit build time).
         //
         // Primary: 3 * n_signers >= 2 * actual_num_pubkeys  (>= ceil(2n/3))
         //   Prove: (3 * n_signers - 2 * actual_num_pubkeys) >= 0  via range check.
@@ -178,19 +181,18 @@ pub fn verify_bls_attestation_with_assigned_msghash<F: BigPrimeField>(
         // Fallback: 2 * n_signers > actual_num_pubkeys  (> 50%)
         //   Prove: (2 * n_signers - actual_num_pubkeys - 1) >= 0  via range check.
         {
-            let n_pk = ctx.load_constant(F::from(actual_num_pubkeys as u64));
             let check_val = match threshold_mode {
                 ThresholdMode::Primary => {
                     let three = ctx.load_constant(F::from(3u64));
                     let two = ctx.load_constant(F::from(2u64));
                     let three_ns = gate.mul(ctx, three, n_signers_cell);
-                    let two_npk = gate.mul(ctx, two, n_pk);
+                    let two_npk = gate.mul(ctx, two, actual_num_pubkeys);
                     gate.sub(ctx, three_ns, two_npk)
                 }
                 ThresholdMode::Fallback => {
                     let two = ctx.load_constant(F::from(2u64));
                     let two_ns = gate.mul(ctx, two, n_signers_cell);
-                    let diff = gate.sub(ctx, two_ns, n_pk);
+                    let diff = gate.sub(ctx, two_ns, actual_num_pubkeys);
                     gate.sub(ctx, diff, one)
                 }
             };
@@ -198,7 +200,7 @@ pub fn verify_bls_attestation_with_assigned_msghash<F: BigPrimeField>(
             range.range_check(ctx, check_val, 16);
         }
 
-        // 5. Compute is_active[i] = (i < n_signers_cell) for each slot.
+        // 6. Compute is_active[i] = (i < n_signers_cell) for each slot.
         let is_active: Vec<AssignedValue<F>> = (0..max_signers)
             .map(|i| {
                 let i_const = ctx.load_constant(F::from(i as u64));
@@ -206,7 +208,7 @@ pub fn verify_bls_attestation_with_assigned_msghash<F: BigPrimeField>(
             })
             .collect();
 
-        // 6. Constrain inactive slots: idx == 0 and count == 0.
+        // 7. Constrain inactive slots: idx == 0 and count == 0.
         for i in 0..max_signers {
             let not_active = gate.sub(ctx, one, is_active[i]);
             let check_idx = gate.mul(ctx, not_active, idx_cells[i]);
@@ -215,10 +217,14 @@ pub fn verify_bls_attestation_with_assigned_msghash<F: BigPrimeField>(
             ctx.constrain_equal(&check_count, &zero);
         }
 
-        // 7. Active-slot constraints.
+        // 8. Active-slot constraints.
         for i in 0..max_signers {
             // 7a. idx < actual_num_pubkeys (prevent referencing padding pubkeys).
-            range.check_less_than_safe(ctx, idx_cells[i], actual_num_pubkeys as u64);
+            // Dynamic bound: constrain (actual_num_pubkeys - 1 - idx) fits in idx_bits.
+            {
+                let diff = gate.sub(ctx, npk_minus_one, idx_cells[i]);
+                range.range_check(ctx, diff, idx_bits);
+            }
 
             // 7b. Strict monotonicity for consecutive active slots.
             if i + 1 < max_signers {
@@ -483,6 +489,7 @@ mod tests {
             let msghash_assigned = pairing_chip.load_private_g2_unchecked(ctx, msg_hash);
             let assigned_pks = load_bk_set_pubkeys(ctx, range, &[pk], 104, 5);
             let all_pub_sum = compute_all_pub_sum(ctx, range, &assigned_pks, 104, 5);
+            let actual_npk = ctx.load_witness(F::from(1u64));
 
             verify_bls_attestation_with_assigned_msghash(
                 pool,
@@ -496,7 +503,7 @@ mod tests {
                 5,
                 ThresholdMode::Primary,
                 all_pub_sum,
-                1, // actual_num_pubkeys
+                actual_npk,
             );
         });
         println!("In-circuit BLS (sk=1) MockProver passed!");
@@ -525,6 +532,7 @@ mod tests {
             let msghash_assigned = pairing_chip.load_private_g2_unchecked(ctx, bad_msg_hash);
             let assigned_pks = load_bk_set_pubkeys(ctx, range, &[pk], 104, 5);
             let all_pub_sum = compute_all_pub_sum(ctx, range, &assigned_pks, 104, 5);
+            let actual_npk = ctx.load_witness(F::from(1u64));
 
             verify_bls_attestation_with_assigned_msghash(
                 pool,
@@ -538,7 +546,7 @@ mod tests {
                 5,
                 ThresholdMode::Primary,
                 all_pub_sum,
-                1, // actual_num_pubkeys
+                actual_npk,
             );
         });
     }
