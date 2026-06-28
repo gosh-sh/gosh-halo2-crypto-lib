@@ -3,7 +3,6 @@ members = [
     "sha256-chip",
     "dense-balanced-tree",
     "bls-verification",
-    "referenced-block-hop",
 ]
 resolver = "2"
 

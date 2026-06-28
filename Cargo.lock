@@ -1411,20 +1411,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gosh-referenced-block-hop"
-version = "0.1.0"
-dependencies = [
- "gosh-dense-balanced-tree",
- "gosh-sha256-chip",
- "halo2-base 0.4.1",
- "halo2-ecc",
- "hex",
- "pse-poseidon",
- "rand 0.8.5",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "gosh-sha256-chip"
 version = "0.1.0"
 dependencies = [
