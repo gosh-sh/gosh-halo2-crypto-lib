@@ -1394,7 +1394,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 name = "gosh-bls-verification"
 version = "0.1.0"
 dependencies = [
- "halo2-base 0.4.0",
+ "halo2-base 0.4.1",
  "halo2-ecc",
  "sha2 0.10.9",
 ]
@@ -1404,7 +1404,7 @@ name = "gosh-dense-balanced-tree"
 version = "0.1.0"
 dependencies = [
  "dense-balanced-tree",
- "halo2-base 0.4.0",
+ "halo2-base 0.4.1",
  "hex",
  "pse-poseidon",
  "rand 0.8.5",
@@ -1414,7 +1414,7 @@ dependencies = [
 name = "gosh-sha256-chip"
 version = "0.1.0"
 dependencies = [
- "halo2-base 0.4.0",
+ "halo2-base 0.4.1",
  "halo2-ecc",
  "hex",
  "rand 0.8.5",
@@ -1437,8 +1437,7 @@ dependencies = [
 [[package]]
 name = "halo2-axiom"
 version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f81aee7974478f9e3ea0cfd349d2a59a3482f7844386486a98e4af9ed8bada6"
+source = "git+https://github.com/gosh-sh/halo2-axiom?branch=main#1f28ded628dbf5be7d0478d46cbda0cb0b158a29"
 dependencies = [
  "blake2b_simd",
  "crossbeam",
@@ -1480,8 +1479,8 @@ dependencies = [
 
 [[package]]
 name = "halo2-base"
-version = "0.4.0"
-source = "git+https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381?branch=main#c0c78ce4d51da8e53de61e26d651a824a9cc3377"
+version = "0.4.1"
+source = "git+https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381?branch=bump-halo2-lib-v0.4.1#26b32240f9243ec4f57519f7f469e1a9f877dc64"
 dependencies = [
  "ark-std 0.3.0",
  "getset",
@@ -1525,11 +1524,11 @@ dependencies = [
 
 [[package]]
 name = "halo2-ecc"
-version = "0.4.0"
-source = "git+https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381?branch=main#c0c78ce4d51da8e53de61e26d651a824a9cc3377"
+version = "0.4.1"
+source = "git+https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381?branch=bump-halo2-lib-v0.4.1#26b32240f9243ec4f57519f7f469e1a9f877dc64"
 dependencies = [
- "halo2-base 0.4.0",
- "itertools 0.10.5",
+ "halo2-base 0.4.1",
+ "itertools 0.11.0",
  "num-bigint 0.4.6",
  "num-integer",
  "num-traits",
@@ -2387,8 +2386,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 [[package]]
 name = "poseidon-primitives"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bd95570f7ea849b4187298b5bb229643e44e1d47ddf3979d0db8a1c28be26a8"
+source = "git+https://github.com/gosh-sh/poseidon-primitives?branch=main#fb1450059deb4ae52b0dfdddcb9fdd6767ae1293"
 dependencies = [
  "bitvec",
  "ff",

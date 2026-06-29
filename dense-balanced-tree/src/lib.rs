@@ -14,10 +14,18 @@ use halo2_base::{
 };
 use pse_poseidon::Poseidon;
 
-const T: usize = 3;
-const RATE: usize = 2;
-const R_F: usize = 8;
-const R_P: usize = 57;
+/// Width of the Poseidon BN254 sponge state used by `poseidon_hash_native`
+/// and every in-circuit gadget in this crate. Made `pub` so downstream
+/// consumers (e.g. the dexdo / bridge circuits) can reference a single
+/// source of truth instead of re-declaring matching constants.
+pub const T: usize = 3;
+/// Absorption rate of the Poseidon sponge — must stay paired with [`T`].
+pub const RATE: usize = 2;
+/// Number of full rounds. Part of the Poseidon parameter set baked into the
+/// verification key; changing it is a breaking change for any deployed proof.
+pub const R_F: usize = 8;
+/// Number of partial rounds. Same caveat as [`R_F`].
+pub const R_P: usize = 57;
 
 /// Maximum number of dense balanced trees in a verification chain.
 /// Both gosh-dark-dex and layer-hashes-update circuits use this constant
