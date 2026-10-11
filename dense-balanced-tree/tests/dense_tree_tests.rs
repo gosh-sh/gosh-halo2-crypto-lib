@@ -434,3 +434,136 @@ fn test_dense_circuit_real_prover() {
 
     println!("=== Real prover test passed for all positions ===");
 }
+
+/// Depth-15 real-prover test: 32,768-leaf tree (upper envelope for the ~30k
+/// leaf case). Exercises keygen + prove + verify at k=14 across three
+/// positions (first, middle, last) with full timings. Marked `#[ignore]`
+/// because the native tree build is ~5-7s and the full sweep is ~30-60s.
+///
+/// Run with:
+///   cargo test --release --test dense_tree_tests \
+///       test_dense_circuit_depth15_real_prover -- --ignored --nocapture
+#[test]
+#[ignore = "heavy: 32,768-leaf tree build + k=14 real prover sweep (~30-60s)"]
+fn test_dense_circuit_depth15_real_prover() {
+    const LEAVES: usize = 32_768; // 2^15
+    let k: usize = 14;
+    let depth: usize = 15;
+
+    println!("=== Depth-15 Real Prover (k={}, depth={}, leaves={}) ===", k, depth, LEAVES);
+
+    // --- Build tree ---
+    let t0 = Instant::now();
+    let (leaves, root_bytes) = build_test_tree(LEAVES);
+    let tree_time = t0.elapsed();
+    println!("  Tree build ({} leaves):   {:?}", LEAVES, tree_time);
+
+    // --- Generate SRS ---
+    let t1 = Instant::now();
+    let params: ParamsKZG<Bn256> = gen_srs(k as u32);
+    let srs_time = t1.elapsed();
+    println!("  SRS generation (k={}):     {:?}", k, srs_time);
+
+    // --- Keygen: build circuit with dummy depth-15 shape ---
+    let t2 = Instant::now();
+    let keygen_builder = build_keygen_circuit(k, depth);
+    let config_params = &keygen_builder.config_params;
+    println!(
+        "  Circuit params:            k={}, num_advice={}, num_lookup_advice={}, num_fixed={}",
+        config_params.k,
+        config_params.num_advice_per_phase[0],
+        config_params.num_lookup_advice_per_phase[0],
+        config_params.num_fixed
+    );
+    let keygen_circuit_time = t2.elapsed();
+    println!("  Keygen circuit build:      {:?}", keygen_circuit_time);
+
+    // --- Generate VK ---
+    let t3 = Instant::now();
+    let vk = keygen_vk(&params, &keygen_builder).expect("keygen_vk should not fail");
+    let vk_time = t3.elapsed();
+    println!("  VK generation:             {:?}", vk_time);
+
+    // --- Generate PK ---
+    let t4 = Instant::now();
+    let pk = keygen_pk(&params, vk, &keygen_builder).expect("keygen_pk should not fail");
+    let pk_time = t4.elapsed();
+    println!("  PK generation:             {:?}", pk_time);
+    println!(
+        "  Total keygen:              {:?}",
+        keygen_circuit_time + vk_time + pk_time
+    );
+
+    // --- Prove at first, middle, last positions ---
+    for pos in [0usize, LEAVES / 2, LEAVES - 1] {
+        println!("--- Proving leaf at pos {} ---", pos);
+
+        // --- Build prover circuit ---
+        let t5 = Instant::now();
+        let (prover_builder, root_fr) = build_prover_circuit(&keygen_builder, &leaves, pos);
+        let prover_circuit_time = t5.elapsed();
+
+        let expected_root_fr = bytes_to_fr(&root_bytes);
+        assert_eq!(root_fr, expected_root_fr, "Native root mismatch at pos {}", pos);
+
+        // --- Create proof ---
+        let t6 = Instant::now();
+        let instances = vec![root_fr];
+        let proof = {
+            let rng = StdRng::seed_from_u64(0);
+            let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+            create_proof::<
+                KZGCommitmentScheme<Bn256>,
+                ProverSHPLONK<'_, Bn256>,
+                Challenge255<_>,
+                _,
+                Blake2bWrite<Vec<u8>, G1Affine, _>,
+                _,
+            >(
+                &params,
+                &pk,
+                &[prover_builder],
+                &[&[instances.as_slice()]],
+                rng,
+                &mut transcript,
+            )
+            .expect("proof generation should not fail");
+            transcript.finalize()
+        };
+        let prove_time = t6.elapsed();
+
+        // --- Verify proof ---
+        let t7 = Instant::now();
+        {
+            let strategy = SingleStrategy::new(&params);
+            let mut transcript =
+                Blake2bRead::<_, _, Challenge255<_>>::init(proof.as_slice());
+            verify_proof::<
+                KZGCommitmentScheme<Bn256>,
+                VerifierSHPLONK<'_, Bn256>,
+                Challenge255<G1Affine>,
+                Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
+                SingleStrategy<'_, Bn256>,
+            >(
+                params.verifier_params(),
+                pk.get_vk(),
+                strategy,
+                &[&[instances.as_slice()]],
+                &mut transcript,
+            )
+            .expect("proof verification should not fail");
+        }
+        let verify_time = t7.elapsed();
+
+        println!("  Prover circuit build:    {:?}", prover_circuit_time);
+        println!("  Proof generation:        {:?}", prove_time);
+        println!("  Proof size:              {} bytes", proof.len());
+        println!("  Proof verification:      {:?}", verify_time);
+        println!(
+            "  Total (build+prove):     {:?}",
+            prover_circuit_time + prove_time
+        );
+    }
+
+    println!("=== Depth-15 real prover test passed for all positions ===");
+}
